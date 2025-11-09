@@ -6,11 +6,20 @@ import logging
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union
+import os
+from pathlib import Path
+import time
+from datetime import datetime
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AbletonMCPServer")
+
+# Cache configuration
+CACHE_DIR = Path.home() / ".ableton-mcp" / "cache"
+INVENTORY_CACHE_FILE = CACHE_DIR / "library_inventory.json"
+CACHE_MAX_AGE_DAYS = 7  # Re-scan if cache is older than 7 days
 
 @dataclass
 class AbletonConnection:
@@ -160,6 +169,97 @@ class AbletonConnection:
             logger.error(f"Error communicating with Ableton: {str(e)}")
             self.sock = None
             raise Exception(f"Communication error with Ableton: {str(e)}")
+
+# Utility functions for inventory caching
+
+def ensure_cache_dir():
+    """Ensure the cache directory exists"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Cache directory: {CACHE_DIR}")
+
+def save_inventory_to_file(inventory_data: Dict[str, Any]) -> bool:
+    """
+    Save inventory data to JSON file.
+
+    Args:
+        inventory_data: The inventory dictionary to save
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        ensure_cache_dir()
+
+        # Add metadata
+        cache_data = {
+            "cached_at": time.time(),
+            "cached_at_readable": datetime.now().isoformat(),
+            "version": "1.0",
+            "inventory": inventory_data
+        }
+
+        # Write to file
+        with open(INVENTORY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Saved inventory to {INVENTORY_CACHE_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving inventory to file: {str(e)}")
+        return False
+
+def load_inventory_from_file() -> Dict[str, Any]:
+    """
+    Load inventory data from JSON file if it exists and is valid.
+
+    Returns:
+        Inventory dictionary or None if cache is invalid/missing
+    """
+    try:
+        if not INVENTORY_CACHE_FILE.exists():
+            logger.info("No cache file found")
+            return None
+
+        # Check file age
+        file_age_days = (time.time() - INVENTORY_CACHE_FILE.stat().st_mtime) / (60 * 60 * 24)
+        if file_age_days > CACHE_MAX_AGE_DAYS:
+            logger.info(f"Cache file is {file_age_days:.1f} days old (max: {CACHE_MAX_AGE_DAYS}), ignoring")
+            return None
+
+        # Load and validate
+        with open(INVENTORY_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+
+        if "inventory" not in cache_data:
+            logger.warning("Cache file missing 'inventory' key")
+            return None
+
+        cached_at = cache_data.get("cached_at_readable", "unknown")
+        logger.info(f"Loaded inventory from cache (cached at: {cached_at})")
+
+        return cache_data["inventory"]
+    except Exception as e:
+        logger.error(f"Error loading inventory from file: {str(e)}")
+        return None
+
+def clear_inventory_cache() -> bool:
+    """
+    Delete the cached inventory file.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        if INVENTORY_CACHE_FILE.exists():
+            INVENTORY_CACHE_FILE.unlink()
+            logger.info(f"Deleted cache file: {INVENTORY_CACHE_FILE}")
+            return True
+        else:
+            logger.info("No cache file to delete")
+            return False
+    except Exception as e:
+        logger.error(f"Error deleting cache file: {str(e)}")
+        return False
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
@@ -607,7 +707,7 @@ def get_browser_items_at_path(ctx: Context, path: str) -> str:
 def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) -> str:
     """
     Load a drum rack and then load a specific drum kit into it.
-    
+
     Parameters:
     - track_index: The index of the track to load on
     - rack_uri: The URI of the drum rack to load (e.g., 'Drums/Drum Rack')
@@ -615,42 +715,182 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) 
     """
     try:
         ableton = get_ableton_connection()
-        
+
         # Step 1: Load the drum rack
         result = ableton.send_command("load_browser_item", {
             "track_index": track_index,
             "item_uri": rack_uri
         })
-        
+
         if not result.get("loaded", False):
             return f"Failed to load drum rack with URI '{rack_uri}'"
-        
+
         # Step 2: Get the drum kit items at the specified path
         kit_result = ableton.send_command("get_browser_items_at_path", {
             "path": kit_path
         })
-        
+
         if "error" in kit_result:
             return f"Loaded drum rack but failed to find drum kit: {kit_result.get('error')}"
-        
+
         # Step 3: Find a loadable drum kit
         kit_items = kit_result.get("items", [])
         loadable_kits = [item for item in kit_items if item.get("is_loadable", False)]
-        
+
         if not loadable_kits:
             return f"Loaded drum rack but no loadable drum kits found at '{kit_path}'"
-        
+
         # Step 4: Load the first loadable kit
         kit_uri = loadable_kits[0].get("uri")
         load_result = ableton.send_command("load_browser_item", {
             "track_index": track_index,
             "item_uri": kit_uri
         })
-        
+
         return f"Loaded drum rack and kit '{loadable_kits[0].get('name')}' on track {track_index}"
     except Exception as e:
         logger.error(f"Error loading drum kit: {str(e)}")
         return f"Error loading drum kit: {str(e)}"
+
+@mcp.tool()
+def get_user_library_inventory(ctx: Context, force_refresh: bool = False) -> str:
+    """
+    Get a comprehensive inventory of the user's Ableton library, including custom instruments,
+    third-party plugins, user-created racks, and samples.
+
+    This tool performs a deep scan of Ableton's browser to identify:
+    - Custom/third-party instruments (e.g., Serum, Massive, Omnisphere, Vital, etc.)
+    - User-created instrument racks and presets
+    - Custom drum kits and samples
+    - User audio effects and MIDI effects
+    - Stock Ableton instruments (limited list for reference)
+
+    The results are cached to disk after the first scan for performance. Use force_refresh=True to rescan.
+
+    CACHING BEHAVIOR:
+    - First call: Scans library and saves to ~/.ableton-mcp/cache/library_inventory.json
+    - Subsequent calls: Loads from file cache (instant)
+    - Cache expires after 7 days (auto-rescan)
+    - force_refresh=True: Ignores cache and rescans from Ableton
+
+    IMPORTANT FOR MUSIC PRODUCTION:
+    - Call this tool at the beginning of music production tasks to understand what's available
+    - Use the returned custom instruments when users request specific styles or sounds
+    - The inventory includes URIs that can be used with load_instrument_or_effect()
+    - Custom items are marked with is_custom=True
+
+    Parameters:
+    - force_refresh: If True, invalidate cache and rescan the entire library (default: False)
+
+    Returns:
+    - JSON formatted inventory with categories, custom items, and their URIs
+    """
+    try:
+        result = None
+
+        # Try to load from file cache first (unless force_refresh)
+        if not force_refresh:
+            result = load_inventory_from_file()
+            if result:
+                logger.info("Using cached inventory from file")
+
+        # If no cache or force_refresh, scan from Ableton
+        if result is None:
+            logger.info("Scanning library from Ableton...")
+            ableton = get_ableton_connection()
+            result = ableton.send_command("get_user_library_inventory", {
+                "force_refresh": force_refresh
+            })
+
+            # Save to file cache
+            if result:
+                save_inventory_to_file(result)
+                logger.info("Inventory cached to disk")
+
+        # Format the result in a more readable way
+        total_items = result.get("total_items", 0)
+        custom_items = result.get("custom_items", 0)
+        stock_items = result.get("stock_items", 0)
+
+        output = f"User Library Inventory (Total: {total_items}, Custom: {custom_items}, Stock: {stock_items})\n\n"
+
+        # Show custom items by category
+        for category_name, category_data in result.get("categories", {}).items():
+            custom_count = category_data.get("custom", 0)
+            if custom_count > 0:
+                output += f"\n{category_name.upper()} - {custom_count} custom items:\n"
+
+                custom_list = category_data.get("custom_items", [])
+                # Group by parent folder for better organization
+                folders = {}
+                for item in custom_list[:100]:  # Limit to first 100 custom items per category
+                    if item.get("is_loadable", False):  # Only show loadable items
+                        path = item.get("path", "")
+                        parts = path.split("/")
+                        folder = parts[1] if len(parts) > 1 else "Root"
+
+                        if folder not in folders:
+                            folders[folder] = []
+                        folders[folder].append(item)
+
+                for folder, items in sorted(folders.items()):
+                    output += f"\n  {folder}:\n"
+                    for item in sorted(items, key=lambda x: x.get("name", ""))[:20]:  # Limit to 20 per folder
+                        name = item.get("name", "Unknown")
+                        uri = item.get("uri", "N/A")
+                        output += f"    - {name}\n"
+                        output += f"      URI: {uri}\n"
+
+        # Add summary of stock items available
+        output += "\n\nSTOCK ABLETON INSTRUMENTS (sample):\n"
+        for category_name, category_data in result.get("categories", {}).items():
+            stock_count = category_data.get("stock", 0)
+            if stock_count > 0:
+                output += f"  {category_name}: {stock_count} items available\n"
+
+        scan_time = result.get("scan_timestamp", 0)
+        output += f"\n\nLast scanned: {time.ctime(scan_time) if scan_time else 'Never'}\n"
+
+        # Show cache location
+        if INVENTORY_CACHE_FILE.exists():
+            cache_age_hours = (time.time() - INVENTORY_CACHE_FILE.stat().st_mtime) / 3600
+            if cache_age_hours < 1:
+                age_str = f"{int(cache_age_hours * 60)} minutes ago"
+            elif cache_age_hours < 24:
+                age_str = f"{cache_age_hours:.1f} hours ago"
+            else:
+                age_str = f"{cache_age_hours / 24:.1f} days ago"
+            output += f"Cache file: {INVENTORY_CACHE_FILE} (updated {age_str})\n"
+        else:
+            output += f"Cache file will be created at: {INVENTORY_CACHE_FILE}\n"
+
+        output += "\nTIP: Use the URIs above with load_instrument_or_effect() to load instruments onto tracks.\n"
+
+        return output
+    except Exception as e:
+        logger.error(f"Error getting user library inventory: {str(e)}")
+        return f"Error getting user library inventory: {str(e)}"
+
+@mcp.tool()
+def clear_library_inventory_cache(ctx: Context) -> str:
+    """
+    Clear the cached library inventory file.
+
+    This forces a fresh scan on the next get_user_library_inventory() call.
+    Use this when you've installed new instruments or packs and want to ensure
+    they're discovered without waiting for the cache to expire (7 days).
+
+    Returns:
+    - Success message if cache was cleared, or info if no cache exists
+    """
+    try:
+        if clear_inventory_cache():
+            return f"Successfully cleared library inventory cache.\nNext scan will query Ableton directly.\nCache location: {INVENTORY_CACHE_FILE}"
+        else:
+            return f"No cache file found to clear.\nCache location: {INVENTORY_CACHE_FILE}"
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        return f"Error clearing cache: {str(e)}"
 
 # Main execution
 def main():

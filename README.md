@@ -128,6 +128,7 @@ Once the config file has been set on Claude, and the remote script is running in
 - Create, edit, and trigger clips
 - Control playback
 - Load instruments and effects from Ableton's browser
+- **Scan and inventory your entire Ableton library (including custom instruments and third-party plugins)**
 - Add notes to MIDI clips
 - Change tempo and other session parameters
 
@@ -135,17 +136,90 @@ Once the config file has been set on Claude, and the remote script is running in
 
 Here are some examples of what you can ask Claude to do:
 
+### Music Production
 - "Create an 80s synthwave track" [Demo](https://youtu.be/VH9g66e42XA)
 - "Create a Metro Boomin style hip-hop beat"
 - "Create a new MIDI track with a synth bass instrument"
 - "Add reverb to my drums"
 - "Create a 4-bar MIDI clip with a simple melody"
+- "Add a jazz chord progression to the clip in track 1"
+
+### Using Custom Instruments
+- **"Scan my Ableton library and show me what custom instruments I have"**
+- **"Create a track using my Serum bass preset"**
+- **"What third-party plugins do I have installed?"**
+- **"Use my custom lofi hip-hop rack for this track"**
+
+### Session Control
 - "Get information about the current Ableton session"
 - "Load a 808 drum rack into the selected track"
-- "Add a jazz chord progression to the clip in track 1"
 - "Set the tempo to 120 BPM"
 - "Play the clip in track 2"
 
+## Understanding Your Custom Library
+
+### Library Inventory Feature
+
+AbletonMCP can scan your entire Ableton library to discover:
+- **Third-party instruments** (Serum, Massive, Omnisphere, Vital, etc.)
+- **User-created instrument racks and presets**
+- **Custom drum kits and sample packs**
+- **Audio and MIDI effects**
+- **Stock Ableton instruments** (for reference)
+
+This allows Claude to intelligently choose the right instruments based on your library and the musical style you're creating.
+
+### How It Works
+
+1. **First Use**: When you ask Claude to scan your library, it performs a deep scan of all browser categories
+2. **Persistent Caching**: Results are saved to `~/.ableton-mcp/cache/library_inventory.json`
+   - First scan: 10-30 seconds (scans Ableton's browser)
+   - Subsequent scans: Instant (loads from file)
+   - Cache expires: After 7 days (auto-rescan)
+   - Persists between sessions (survives restarts)
+3. **Smart Detection**: The system identifies custom content by looking for:
+   - Items in "User Library" folders
+   - Known third-party plugin names
+   - Custom naming patterns (e.g., "My Bass Rack")
+4. **URI Mapping**: Each instrument gets a unique URI that Claude can use to load it
+
+### Best Practices
+
+**Start Your Music Production Sessions With:**
+```
+"Scan my Ableton library first, then create a [style] track"
+```
+
+This helps Claude understand what instruments you have available before making suggestions.
+
+**Example Workflow:**
+```
+User: "Scan my library and then create a dark ambient track"
+
+Claude will:
+1. Scan and identify custom instruments (e.g., Omnisphere pads, custom ambient racks)
+2. Choose appropriate instruments from YOUR library
+3. Create tracks using your custom sounds
+4. Fall back to stock Ableton instruments when needed
+```
+
+### Refreshing the Inventory
+
+If you install new instruments or packs, you have two options:
+
+**Option 1: Force Refresh (Recommended)**
+```
+"Rescan my Ableton library to find new instruments"
+```
+This forces a fresh scan and updates the cached inventory file.
+
+**Option 2: Clear Cache**
+```
+"Clear my library inventory cache"
+```
+This deletes the cache file. The next scan will be fresh from Ableton.
+
+**Auto-Refresh**: Cache automatically expires after 7 days, triggering a fresh scan.
 
 ## Troubleshooting
 

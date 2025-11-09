@@ -38,7 +38,10 @@ class AbletonMCP(ControlSurface):
         
         # Cache the song reference for easier access
         self._song = self.song()
-        
+
+        # Cache for user library inventory
+        self._library_inventory_cache = None
+
         # Start the socket server
         self.start_server()
         
@@ -326,6 +329,9 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
                 response["result"] = self.get_browser_items_at_path(path)
+            elif command_type == "get_user_library_inventory":
+                force_refresh = params.get("force_refresh", False)
+                response["result"] = self._get_user_library_inventory(force_refresh)
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -819,6 +825,192 @@ class AbletonMCP(ControlSurface):
                 return "unknown"
         except:
             return "unknown"
+
+    def _get_user_library_inventory(self, force_refresh=False):
+        """
+        Scan and return an inventory of the user's library including custom instruments,
+        third-party plugins, and user-created content.
+
+        Args:
+            force_refresh: If True, invalidate cache and rescan the library
+
+        Returns:
+            Dictionary with categorized inventory of user's custom components
+        """
+        try:
+            # Return cached data if available and not forcing refresh
+            if self._library_inventory_cache is not None and not force_refresh:
+                self.log_message("Returning cached library inventory")
+                return self._library_inventory_cache
+
+            self.log_message("Scanning user library inventory (this may take a moment)...")
+
+            # Access the application's browser instance
+            app = self.application()
+            if not app:
+                raise RuntimeError("Could not access Live application")
+
+            if not hasattr(app, 'browser') or app.browser is None:
+                raise RuntimeError("Browser is not available in the Live application")
+
+            # Initialize inventory structure
+            inventory = {
+                "total_items": 0,
+                "custom_items": 0,
+                "stock_items": 0,
+                "categories": {},
+                "scan_timestamp": time.time()
+            }
+
+            # Define categories to scan
+            categories_to_scan = [
+                ("instruments", app.browser.instruments if hasattr(app.browser, 'instruments') else None),
+                ("sounds", app.browser.sounds if hasattr(app.browser, 'sounds') else None),
+                ("drums", app.browser.drums if hasattr(app.browser, 'drums') else None),
+                ("audio_effects", app.browser.audio_effects if hasattr(app.browser, 'audio_effects') else None),
+                ("midi_effects", app.browser.midi_effects if hasattr(app.browser, 'midi_effects') else None)
+            ]
+
+            # Helper function to determine if an item is custom/third-party
+            def is_custom_item(item, path_parts):
+                """Determine if a browser item is custom or third-party content"""
+                if not hasattr(item, 'name'):
+                    return False
+
+                # Check for user library indicators in the path
+                path_lower = [p.lower() for p in path_parts]
+                custom_indicators = [
+                    'user library',
+                    'user',
+                    'packs',
+                    'downloaded',
+                    'samples',
+                    'my ',
+                    'custom'
+                ]
+
+                for indicator in custom_indicators:
+                    if any(indicator in part for part in path_lower):
+                        return True
+
+                # Check item name for common third-party plugin names
+                name_lower = item.name.lower()
+                third_party_keywords = [
+                    'serum', 'massive', 'omnisphere', 'sylenth', 'spire',
+                    'nexus', 'kontakt', 'reaktor', 'pigments', 'vital',
+                    'phase plant', 'diva', 'repro', 'u-he', 'arturia',
+                    'native instruments', 'spectrasonics', 'lennar',
+                    'vst', 'au', 'rack', 'preset', 'my', 'custom'
+                ]
+
+                for keyword in third_party_keywords:
+                    if keyword in name_lower:
+                        return True
+
+                return False
+
+            # Helper function to recursively scan a browser item
+            def scan_item(item, category_name, path_parts=[], depth=0, max_depth=8):
+                """Recursively scan a browser item and its children"""
+                if depth >= max_depth or not item:
+                    return []
+
+                items = []
+                current_path = '/'.join(path_parts) if path_parts else category_name
+
+                try:
+                    # Get item information
+                    item_info = {
+                        "name": item.name if hasattr(item, 'name') else "Unknown",
+                        "path": current_path,
+                        "uri": item.uri if hasattr(item, 'uri') else None,
+                        "is_folder": hasattr(item, 'children') and bool(item.children),
+                        "is_device": hasattr(item, 'is_device') and item.is_device,
+                        "is_loadable": hasattr(item, 'is_loadable') and item.is_loadable,
+                        "is_custom": is_custom_item(item, path_parts),
+                        "category": category_name,
+                        "depth": depth
+                    }
+
+                    # Only add loadable items or folders to the inventory
+                    if item_info["is_loadable"] or item_info["is_folder"]:
+                        items.append(item_info)
+
+                    # Recursively scan children if this is a folder
+                    if hasattr(item, 'children') and item.children:
+                        child_count = 0
+                        for child in item.children:
+                            # Limit children per folder to avoid timeout
+                            if child_count >= 50:
+                                self.log_message("Limiting scan at {0} (50+ children)".format(current_path))
+                                break
+
+                            child_path_parts = path_parts + [item_info["name"]]
+                            child_items = scan_item(child, category_name, child_path_parts, depth + 1, max_depth)
+                            items.extend(child_items)
+                            child_count += 1
+
+                except Exception as e:
+                    self.log_message("Error scanning item at {0}: {1}".format(current_path, str(e)))
+
+                return items
+
+            # Scan each category
+            for category_name, category_root in categories_to_scan:
+                if category_root is None:
+                    continue
+
+                self.log_message("Scanning category: {0}".format(category_name))
+
+                try:
+                    # Scan the category
+                    category_items = scan_item(category_root, category_name, [category_name], 0, 8)
+
+                    # Separate custom and stock items
+                    custom_items = [item for item in category_items if item["is_custom"]]
+                    stock_items = [item for item in category_items if not item["is_custom"]]
+
+                    # Add to inventory
+                    inventory["categories"][category_name] = {
+                        "total": len(category_items),
+                        "custom": len(custom_items),
+                        "stock": len(stock_items),
+                        "custom_items": custom_items,
+                        "stock_items": stock_items[:20]  # Limit stock items to first 20 to save space
+                    }
+
+                    inventory["total_items"] += len(category_items)
+                    inventory["custom_items"] += len(custom_items)
+                    inventory["stock_items"] += len(stock_items)
+
+                    self.log_message("Found {0} items in {1} ({2} custom, {3} stock)".format(
+                        len(category_items), category_name, len(custom_items), len(stock_items)
+                    ))
+
+                except Exception as e:
+                    self.log_message("Error scanning category {0}: {1}".format(category_name, str(e)))
+                    inventory["categories"][category_name] = {
+                        "error": str(e),
+                        "total": 0,
+                        "custom": 0,
+                        "stock": 0,
+                        "custom_items": [],
+                        "stock_items": []
+                    }
+
+            # Cache the result
+            self._library_inventory_cache = inventory
+
+            self.log_message("Library inventory scan complete: {0} total items ({1} custom, {2} stock)".format(
+                inventory["total_items"], inventory["custom_items"], inventory["stock_items"]
+            ))
+
+            return inventory
+
+        except Exception as e:
+            self.log_message("Error getting user library inventory: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
     
     def get_browser_tree(self, category_type="all"):
         """
